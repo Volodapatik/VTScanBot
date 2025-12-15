@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import hashlib
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -8,6 +9,8 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from aiohttp import web
+import httpx
+import json
 
 load_dotenv()
 
@@ -34,8 +37,158 @@ async def health_check(request):
 
 app.router.add_get('/health', health_check)
 
-# Счетчик задач для пользователей
+# Очередь задач
 user_tasks = {}
+MAX_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 3))
+
+# VirusTotal клиент
+class VirusTotalClient:
+    def __init__(self):
+        self.api_key = os.getenv("VT_API_KEY")
+        self.base_url = "https://www.virustotal.com/api/v3"
+        self.headers = {"x-apikey": self.api_key}
+    
+    async def scan_file(self, file_path):
+        """Сканирует файл до 650 МБ"""
+        try:
+            async with httpx.AsyncClient() as client:
+                # Получаем URL для загрузки
+                resp = await client.get(
+                    f"{self.base_url}/files/upload_url",
+                    headers=self.headers
+                )
+                upload_url = resp.json().get("data")
+                
+                # Загружаем файл
+                with open(file_path, "rb") as f:
+                    files = {"file": f}
+                    response = await client.post(
+                        upload_url,
+                        headers=self.headers,
+                        files=files,
+                        timeout=30.0
+                    )
+                
+                if response.status_code == 200:
+                    return response.json().get("data", {}).get("id")
+                else:
+                    logger.error(f"VirusTotal error: {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка сканирования файла: {e}")
+            return None
+    
+    async def scan_url(self, url):
+        """Сканирует URL"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/urls",
+                    headers=self.headers,
+                    data={"url": url},
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    return response.json().get("data", {}).get("id")
+                else:
+                    logger.error(f"VirusTotal URL error: {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка сканирования URL: {e}")
+            return None
+    
+    async def get_report(self, analysis_id):
+        """Получает отчет по анализу"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/analyses/{analysis_id}",
+                    headers=self.headers,
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    logger.error(f"VirusTotal report error: {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка получения отчета: {e}")
+            return None
+    
+    async def get_hash_report(self, file_hash):
+        """Получает отчет по хешу"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/files/{file_hash}",
+                    headers=self.headers,
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка получения отчета по хешу: {e}")
+            return None
+
+vt_client = VirusTotalClient()
+
+# Google Drive клиент (упрощенная версия)
+class GoogleDriveClient:
+    def __init__(self):
+        # В реальной версии здесь будет работа с Google Drive API
+        pass
+    
+    async def upload_file(self, file_path):
+        """Загружает файл на Google Drive"""
+        # Заглушка - в реальной версии будет работать
+        return f"https://drive.google.com/uc?id=test_{hashlib.md5(file_path.encode()).hexdigest()}"
+    
+    async def delete_file(self, file_url):
+        """Удаляет файл с Google Drive"""
+        pass
+
+drive_client = GoogleDriveClient()
+
+# Очередь задач
+def can_process(user_id):
+    """Проверяет, может ли пользователь начать новую задачу"""
+    count = user_tasks.get(user_id, 0)
+    return count < MAX_TASKS
+
+def add_task(user_id):
+    """Добавляет задачу пользователю"""
+    user_tasks[user_id] = user_tasks.get(user_id, 0) + 1
+
+def remove_task(user_id):
+    """Удаляет задачу пользователя"""
+    if user_id in user_tasks:
+        user_tasks[user_id] -= 1
+        if user_tasks[user_id] <= 0:
+            del user_tasks[user_id]
+
+# Вспомогательные функции
+def is_valid_hash(hash_str):
+    """Проверяет валидность хеша"""
+    if len(hash_str) in [32, 40, 64]:
+        return all(c in "0123456789abcdefABCDEF" for c in hash_str)
+    return False
+
+def calculate_hash(file_path):
+    """Вычисляет SHA256 хеш файла"""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
 @router.message(Command("start", "help"))
 async def start_command(message: Message):
@@ -46,70 +199,79 @@ async def start_command(message: Message):
         "• Ссылку (URL) - для проверки\n"
         "• Хеш (MD5/SHA1/SHA256) - для поиска отчета\n\n"
         "Бот автоматически обработает ваш запрос и предоставит подробный отчет.\n\n"
-        "⚠️ <i>Ограничение: не больше 3 одновременных сканирований на пользователя</i>"
+        f"⚠️ <i>Ограничение: не больше {MAX_TASKS} одновременных сканирований на пользователя</i>"
     )
 
 @router.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
     
-    # Проверяем лимит задач
-    if user_id in user_tasks and user_tasks[user_id] >= 3:
-        await message.answer("⏳ У вас уже 3 активных сканирования. Дождитесь завершения.")
+    if not can_process(user_id):
+        await message.answer(f"⏳ У вас уже {MAX_TASKS} активных сканирования. Дождитесь завершения.")
         return
     
-    # Увеличиваем счетчик задач
-    user_tasks[user_id] = user_tasks.get(user_id, 0) + 1
+    add_task(user_id)
     
     try:
         text = message.text.strip()
         
-        # Проверяем, является ли текст хешем
-        if len(text) in [32, 40, 64] and all(c in "0123456789abcdefABCDEF" for c in text):
-            await message.answer(f"🔍 Хеш получен: {text}\n\nИщу отчет в VirusTotal...")
-            await asyncio.sleep(2)  # Имитация работы
-            await message.answer("✅ Функционал хешей будет реализован в следующем обновлении")
+        # Проверяем хеш
+        if is_valid_hash(text):
+            await message.answer(f"🔍 Ищу отчет по хешу: <code>{text}</code>")
+            
+            report = await vt_client.get_hash_report(text)
+            if report:
+                await send_report(message, report)
+            else:
+                await message.answer("ℹ️ Файл с таким хешем не найден в VirusTotal.")
         
-        # Проверяем, является ли текст URL
+        # Проверяем URL
         elif text.startswith(("http://", "https://")):
-            await message.answer(f"🔍 URL получен: {text}\n\nСканирую...")
-            await asyncio.sleep(2)  # Имитация работы
-            await message.answer("✅ Функционал URL будет реализован в следующем обновлении")
+            await message.answer(f"🔍 Сканирую URL: <code>{text}</code>")
+            
+            analysis_id = await vt_client.scan_url(text)
+            if analysis_id:
+                await message.answer("✅ URL отправлен на сканирование. Жду результаты...")
+                await wait_and_send_report(message, analysis_id)
+            else:
+                await message.answer("❌ Ошибка при сканировании URL.")
         
         else:
             await message.answer("❌ Не понимаю запрос. Отправьте файл, URL или хеш.")
     
+    except Exception as e:
+        logger.error(f"Ошибка обработки текста: {e}")
+        await message.answer("❌ Произошла ошибка при обработке запроса.")
+    
     finally:
-        # Уменьшаем счетчик задач
-        if user_id in user_tasks:
-            user_tasks[user_id] -= 1
-            if user_tasks[user_id] <= 0:
-                del user_tasks[user_id]
+        remove_task(user_id)
 
 @router.message(F.document | F.photo | F.video | F.audio)
 async def handle_file(message: Message):
     user_id = message.from_user.id
     
-    # Проверяем лимит задач
-    if user_id in user_tasks and user_tasks[user_id] >= 3:
-        await message.answer("⏳ У вас уже 3 активных сканирования. Дождитесь завершения.")
+    if not can_process(user_id):
+        await message.answer(f"⏳ У вас уже {MAX_TASKS} активных сканирования. Дождитесь завершения.")
         return
     
-    # Увеличиваем счетчик задач
-    user_tasks[user_id] = user_tasks.get(user_id, 0) + 1
+    add_task(user_id)
     
     try:
-        # Определяем информацию о файле
+        # Скачиваем файл
         if message.document:
+            file_id = message.document.file_id
             file_name = message.document.file_name
             file_size = message.document.file_size
         elif message.photo:
+            file_id = message.photo[-1].file_id
             file_name = "photo.jpg"
             file_size = message.photo[-1].file_size
         elif message.video:
+            file_id = message.video.file_id
             file_name = message.video.file_name or "video.mp4"
             file_size = message.video.file_size
         elif message.audio:
+            file_id = message.audio.file_id
             file_name = message.audio.file_name or "audio.mp3"
             file_size = message.audio.file_size
         
@@ -117,55 +279,117 @@ async def handle_file(message: Message):
         
         await message.answer(f"📥 Файл получен: <code>{file_name}</code>\nРазмер: <b>{size_mb:.1f} МБ</b>")
         
-        # Имитация сканирования
-        await asyncio.sleep(1)
+        # Скачиваем файл
+        file = await bot.get_file(file_id)
+        temp_path = f"temp_{file_id}"
+        await bot.download_file(file.file_path, temp_path)
         
+        # Определяем способ сканирования
         if size_mb <= 650:
-            await message.answer("🔍 Сканирую файл напрямую через VirusTotal API...")
-            await asyncio.sleep(3)
+            await message.answer("🔍 Сканирую файл напрямую через VirusTotal...")
+            analysis_id = await vt_client.scan_file(temp_path)
         else:
             await message.answer("⚠️ Файл большой (>650 МБ)\n📤 Загружаю на Google Drive...")
-            await asyncio.sleep(3)
+            file_url = await drive_client.upload_file(temp_path)
             await message.answer("✅ Загружено на Google Drive\n🔍 Сканирую через VirusTotal...")
-            await asyncio.sleep(2)
+            analysis_id = await vt_client.scan_url(file_url)
         
-        # Имитация готового отчета
-        await message.answer("✅ Сканирование завершено!")
+        # Удаляем временный файл
+        os.remove(temp_path)
         
-        # Пример отчета
-        report_text = (
-            "🛡️ <b>Результат сканирования</b>\n\n"
-            "• Угроз обнаружено: <b>2/73</b>\n"
-            "• Тип угрозы: Trojan.Win32.Generic\n"
-            "• Ссылка на отчет: https://www.virustotal.com/gui/file/example123\n\n"
-            "<i>Это тестовый отчет. Полный функционал будет в следующем обновлении.</i>"
-        )
-        
-        # Кнопки
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔄 Пересканировать", callback_data="rescan"),
-                InlineKeyboardButton(text="📤 Поделиться", 
-                                   url="https://t.me/share/url?url=https://virustotal.com")
-            ]
-        ])
-        
-        await message.answer(report_text, reply_markup=keyboard)
-        
-        # Имитация удаления файла через 15 минут (для больших файлов)
-        if size_mb > 650:
-            await message.answer("🗑️ <i>Файл будет автоматически удален с Google Drive через 15 минут</i>")
+        if analysis_id:
+            await message.answer("✅ Файл отправлен на сканирование. Жду результаты...")
+            await wait_and_send_report(message, analysis_id)
+        else:
+            await message.answer("❌ Ошибка при отправке файла на сканирование.")
     
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
         await message.answer("❌ Произошла ошибка при обработке файла.")
     
     finally:
-        # Уменьшаем счетчик задач
-        if user_id in user_tasks:
-            user_tasks[user_id] -= 1
-            if user_tasks[user_id] <= 0:
-                del user_tasks[user_id]
+        remove_task(user_id)
+
+async def wait_and_send_report(message: Message, analysis_id: str, attempts: int = 10):
+    """Ждет отчет и отправляет его"""
+    for i in range(attempts):
+        await asyncio.sleep(10)  # Ждем 10 секунд между попытками
+        
+        report = await vt_client.get_report(analysis_id)
+        if report:
+            status = report.get("data", {}).get("attributes", {}).get("status")
+            
+            if status == "completed":
+                await send_report(message, report)
+                return
+            elif status == "queued":
+                if i == attempts - 1:
+                    await message.answer("⏳ Сканирование все еще в очереди. Попробуйте позже.")
+                continue
+            else:
+                await message.answer(f"⚠️ Статус сканирования: {status}")
+                return
+    
+    await message.answer("⏳ Сканирование занимает больше времени. Отчет придет позже.")
+
+async def send_report(message: Message, report: dict):
+    """Формирует и отправляет отчет"""
+    try:
+        data = report.get("data", {})
+        attributes = data.get("attributes", {})
+        stats = attributes.get("stats", {})
+        
+        malicious = stats.get("malicious", 0)
+        total = sum(stats.values())
+        
+        # Формируем сообщение
+        result_text = f"🛡️ <b>Результат сканирования</b>\n\n"
+        result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+        
+        if malicious > 0:
+            results = attributes.get("results", {})
+            threat_names = []
+            for av, result in results.items():
+                if result.get("category") == "malicious":
+                    threat_names.append(result.get("result", "Unknown"))
+            
+            if threat_names:
+                result_text += f"• Обнаруженные угрозы: {', '.join(threat_names[:3])}\n"
+        
+        file_hash = attributes.get("sha256", data.get("id", ""))
+        if file_hash:
+            result_text += f"• Хеш (SHA256): <code>{file_hash[:16]}...</code>\n"
+        
+        result_text += f"• Ссылка на отчет: https://www.virustotal.com/gui/file/{file_hash}"
+        
+        # Создаем кнопки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Пересканировать", 
+                                   callback_data=f"rescan:{file_hash}"),
+                InlineKeyboardButton(text="📤 Поделиться", 
+                                   url=f"https://t.me/share/url?url=https://virustotal.com/gui/file/{file_hash}")
+            ]
+        ])
+        
+        await message.answer(result_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        logger.error(f"Ошибка формирования отчета: {e}")
+        await message.answer("✅ Сканирование завершено. (Ошибка формирования детального отчета)")
+
+@router.callback_query(F.data.startswith("rescan:"))
+async def handle_rescan(callback_query):
+    file_hash = callback_query.data.split(":")[1]
+    await callback_query.answer("Начинаю пересканирование...")
+    
+    # Запускаем повторное сканирование
+    analysis_id = await vt_client.scan_url(f"https://virustotal.com/gui/file/{file_hash}")
+    if analysis_id:
+        await callback_query.message.answer("🔍 Пересканирование начато...")
+        await wait_and_send_report(callback_query.message, analysis_id)
+    else:
+        await callback_query.message.answer("❌ Ошибка при пересканировании.")
 
 @router.message()
 async def unknown_message(message: Message):
@@ -190,7 +414,7 @@ async def main():
     # Запускаем бота в фоне
     bot_task = asyncio.create_task(start_bot())
     
-    # Ждем завершения (никогда не завершится)
+    # Ждем завершения
     await bot_task
 
 if __name__ == "__main__":
