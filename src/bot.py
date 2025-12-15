@@ -36,7 +36,6 @@ app.router.add_get('/health', health_check)
 
 user_tasks = {}
 MAX_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 3))
-# Храним информацию о файлах: {analysis_id: {"user_id": 123, "file_hash": "abc", "timestamp": 123}}
 file_info_cache = {}
 
 class VirusTotalClient:
@@ -46,9 +45,7 @@ class VirusTotalClient:
         self.headers = {"x-apikey": self.api_key}
     
     async def scan_file(self, file_path):
-        """Сканирует файл и ВЫЧИСЛЯЕТ SHA256 локально"""
         try:
-            # ВЫЧИСЛЯЕМ SHA256 локально перед отправкой
             file_hash = self.calculate_sha256(file_path)
             logger.info(f"Локальный SHA256 файла: {file_hash}")
             
@@ -73,10 +70,9 @@ class VirusTotalClient:
                     analysis_id = data.get("data", {}).get("id")
                     logger.info(f"Файл загружен, анализ ID: {analysis_id}")
                     
-                    # СОХРАНЯЕМ ИНФОРМАЦИЮ О ФАЙЛЕ
                     return {
                         'analysis_id': analysis_id,
-                        'sha256': file_hash,  # НАШ локальный хеш
+                        'sha256': file_hash,
                         'status': 'uploaded'
                     }
                 else:
@@ -88,7 +84,6 @@ class VirusTotalClient:
             return None
     
     def calculate_sha256(self, file_path):
-        """Вычисляет SHA256 файла"""
         sha256_hash = hashlib.sha256()
         with open(file_path, "rb") as f:
             for byte_block in iter(lambda: f.read(4096), b""):
@@ -138,7 +133,6 @@ class VirusTotalClient:
             return None
     
     async def get_file_report(self, file_hash):
-        """Получает ПОЛНЫЙ отчет по хешу"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
@@ -159,33 +153,6 @@ class VirusTotalClient:
                     
         except Exception as e:
             logger.error(f"Ошибка получения отчета по хешу: {e}")
-            return None
-    
-    async def search_by_analysis_id(self, analysis_id):
-        """Ищет файл по ID анализа (альтернативный способ)"""
-        try:
-            async with httpx.AsyncClient() as client:
-                # Пробуем получить информацию об анализе
-                response = await client.get(
-                    f"{self.base_url}/analyses/{analysis_id}",
-                    headers=self.headers
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    # Ищем хеш в ответе
-                    attrs = data.get("data", {}).get("attributes", {})
-                    
-                    # Пробуем разные пути
-                    sha256 = attrs.get("sha256")
-                    if not sha256:
-                        sha256 = attrs.get("meta", {}).get("file_info", {}).get("sha256")
-                    
-                    return sha256
-                return None
-                    
-        except Exception as e:
-            logger.error(f"Ошибка поиска по анализу: {e}")
             return None
 
 vt_client = VirusTotalClient()
@@ -220,17 +187,92 @@ def is_valid_hash(hash_str):
         return all(c in "0123456789abcdefABCDEF" for c in hash_str)
     return False
 
-@router.message(Command("start", "help"))
+# ==================== НОВЫЕ КОМАНДЫ ====================
+@router.message(Command("start"))
 async def start_command(message: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Как пользоваться", callback_data="help_btn"),
+         InlineKeyboardButton(text="ℹ️ О боте", callback_data="about_btn")],
+        [InlineKeyboardButton(text="🔍 Тестовые хеши", callback_data="test_hashes_btn")]
+    ])
+    
     await message.answer(
         "🛡️ <b>VTScanBot - Сканер VirusTotal</b>\n\n"
-        "Отправьте мне файл или ссылку для сканирования.\n"
-        f"⚠️ <i>Ограничение: {MAX_TASKS} одновременных сканирований</i>"
+        "Отправьте файл, ссылку или хеш для проверки.\n\n"
+        "📎 <b>Файлы</b> до 650 МБ\n"
+        "🔗 <b>Ссылки</b> (URL)\n"
+        "🔎 <b>Хеши</b> MD5/SHA1/SHA256\n\n"
+        "📊 <i>Полные отчеты как на сайте VirusTotal</i>",
+        reply_markup=keyboard
     )
+
+@router.message(Command("about"))
+async def about_command(message: Message):
+    await message.answer("""🤖 <b>VTScanBot - Сканер файлов через VirusTotal</b>
+
+🔐 <b>Безопасность прежде всего!</b>
+
+<b>Этот бот позволяет:</b>
+• 🔍 Сканировать файлы на вирусы через 70+ антивирусов VirusTotal
+• 🌐 Проверять ссылки (URL) на безопасность
+• 🔎 Искать отчеты по хешам файлов (MD5/SHA1/SHA256)
+• 📊 Получать детальные отчеты как на сайте VirusTotal
+• 🔗 Проверять результаты на официальном сайте
+
+📋 <b>Как пользоваться:</b>
+1. Просто отправьте боту файл (до 650 МБ)
+2. Или отправьте ссылку (URL) для проверки
+3. Или отправьте хеш файла для поиска отчета
+
+⚡ <b>Особенности:</b>
+✅ Мгновенное сканирование уже известных файлов
+✅ Полные отчеты с деталями обнаружений
+✅ Прямые ссылки на VirusTotal для проверки
+✅ Очередь запросов (до 3 одновременно)
+✅ Работает 24/7 на надежном хостинге
+
+⚠️ <b>Важно:</b>
+• Бот использует официальный API VirusTotal
+• Все проверки анонимны и безопасны
+• Файлы >650 МБ требуют дополнительной настройки
+• Бесплатный тариф: 500 проверок/день
+
+🛡️ <b>VirusTotal</b> — ведущая платформа для проверки файлов, используемая 70+ антивирусными компаниями.
+
+<b>Начните сканирование — отправьте файл, ссылку или хеш!</b>
+
+---
+<b>Разработчик:</b> @volodapatik230
+<b>Технологии:</b> Python, aiogram, VirusTotal API, Railway.app
+<b>Версия:</b> 1.0 • Декабрь 2025""")
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer("""📚 <b>Краткая помощь:</b>
+
+<b>Что можно отправить:</b>
+1. 📎 <b>Файл</b> - любой документ, фото, видео, аудио (до 650 МБ)
+2. 🔗 <b>URL</b> - ссылка на сайт или файл
+3. 🔎 <b>Хеш</b> - MD5 (32 символа), SHA1 (40), SHA256 (64)
+
+<b>Примеры:</b>
+• Файл: просто отправьте документ
+• URL: <code>https://google.com</code>
+• Хеш: <code>44d88612fea8a8f36de82e1278abb02f</code>
+
+<b>Команды:</b>
+/start - начать работу
+/help - эта справка
+/about - информация о боте
+/hash - тестовые хеши для проверки
+
+<b>Ограничения:</b>
+• Не более 3 одновременных сканирований
+• До 500 проверок в день (бесплатный тариф)
+• Файлы до 650 МБ (большие требуют настройки)""")
 
 @router.message(Command("hash"))
 async def hash_command(message: Message):
-    """Вычисляет хеш файла"""
     await message.answer(
         "🔍 <b>Тестовые хеши EICAR:</b>\n\n"
         "• MD5: <code>44d88612fea8a8f36de82e1278abb02f</code>\n"
@@ -238,6 +280,23 @@ async def hash_command(message: Message):
         "• SHA256: <code>275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f</code>\n\n"
         "<i>Отправьте любой хеш для поиска отчета</i>"
     )
+
+# Обработчики кнопок
+@router.callback_query(F.data == "help_btn")
+async def help_button(callback_query):
+    await callback_query.answer()
+    await help_command(callback_query.message)
+
+@router.callback_query(F.data == "about_btn")
+async def about_button(callback_query):
+    await callback_query.answer()
+    await about_command(callback_query.message)
+
+@router.callback_query(F.data == "test_hashes_btn")
+async def test_hashes_button(callback_query):
+    await callback_query.answer()
+    await hash_command(callback_query.message)
+# ==================== КОНЕЦ НОВЫХ КОМАНД ====================
 
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -255,7 +314,6 @@ async def handle_text(message: Message):
         if is_valid_hash(text):
             await message.answer(f"🔍 Ищу отчет по хешу: <code>{text}</code>")
             
-            # НЕМЕДЛЕННО пробуем получить полный отчет
             report = await vt_client.get_file_report(text)
             if report:
                 await send_full_vt_report(message, report)
@@ -315,16 +373,13 @@ async def handle_file(message: Message):
         size_mb = file_size / 1024 / 1024
         await message.answer(f"📥 Файл: <b>{file_name}</b>\nРазмер: {size_mb:.1f} МБ")
         
-        # Скачиваем и вычисляем хеш
         file = await bot.get_file(file_id)
         temp_path = f"temp_{int(time.time())}_{file_id}"
         await bot.download_file(file.file_path, temp_path)
         
-        # ВЫЧИСЛЯЕМ SHA256 ПЕРЕД ОТПРАВКОЙ
         file_hash = vt_client.calculate_sha256(temp_path)
         logger.info(f"📊 Локальный SHA256: {file_hash}")
         
-        # Проверяем, может файл уже есть в базе VT
         existing_report = await vt_client.get_file_report(file_hash)
         if existing_report:
             logger.info(f"✅ Файл уже в базе VT, отправляю отчет")
@@ -336,7 +391,6 @@ async def handle_file(message: Message):
             remove_task(user_id)
             return
         
-        # Если нет - загружаем
         if size_mb <= 650:
             await message.answer("🔍 Сканирую файл...")
             result = await vt_client.scan_file(temp_path)
@@ -350,10 +404,9 @@ async def handle_file(message: Message):
             os.remove(temp_path)
         
         if result:
-            # СОХРАНЯЕМ ИНФОРМАЦИЮ О ФАЙЛЕ
             file_info_cache[result['analysis_id']] = {
                 'user_id': user_id,
-                'sha256': file_hash,  # НАШ локальный хеш
+                'sha256': file_hash,
                 'timestamp': time.time(),
                 'message_id': message.message_id
             }
@@ -374,12 +427,10 @@ async def handle_file(message: Message):
 
 async def wait_and_process_analysis(message: Message, analysis_id: str, user_id: int, 
                                    is_url: bool, known_hash: str = None):
-    """Ожидает анализ и пытается получить полный отчет"""
     logger.info(f"🔍 Ожидание анализа {analysis_id}, известный хеш: {known_hash}")
     
-    # СПОСОБ 1: Если знаем хеш - пробуем получить полный отчет
     if known_hash:
-        for attempt in range(12):  # 12 попыток × 15 сек = 3 минуты
+        for attempt in range(12):
             await asyncio.sleep(15)
             
             logger.info(f"Попытка {attempt+1}: запрашиваю полный отчет для {known_hash}")
@@ -390,16 +441,14 @@ async def wait_and_process_analysis(message: Message, analysis_id: str, user_id:
                 await send_full_vt_report(message, full_report)
                 return
             
-            # Проверяем статус анализа
             analysis = await vt_client.get_analysis_report(analysis_id)
             if analysis:
                 status = analysis.get("data", {}).get("attributes", {}).get("status")
                 logger.info(f"Статус анализа: {status}")
     
-    # СПОСОБ 2: Если не знаем хеш или не получили отчет
     logger.info("Использую резервный способ...")
     
-    for attempt in range(8):  # Дополнительные 2 минуты
+    for attempt in range(8):
         await asyncio.sleep(15)
         
         analysis = await vt_client.get_analysis_report(analysis_id)
@@ -410,7 +459,6 @@ async def wait_and_process_analysis(message: Message, analysis_id: str, user_id:
         logger.info(f"Анализ {analysis_id}, статус: {status}")
         
         if status == "completed":
-            # Пробуем извлечь хеш из анализа
             attrs = analysis.get("data", {}).get("attributes", {})
             found_hash = attrs.get("sha256")
             
@@ -419,30 +467,26 @@ async def wait_and_process_analysis(message: Message, analysis_id: str, user_id:
             
             if found_hash:
                 logger.info(f"Найден хеш в анализе: {found_hash}")
-                await asyncio.sleep(10)  # Даем время на обработку
+                await asyncio.sleep(10)
                 
                 full_report = await vt_client.get_file_report(found_hash)
                 if full_report:
                     await send_full_vt_report(message, full_report)
                     return
             
-            # Если не нашли полный отчет - показываем базовый
             await send_basic_analysis_report(message, analysis)
             return
         
         elif status == "queued":
             continue
     
-    # Если ничего не получилось
     await message.answer("⏳ VirusTotal обрабатывает файл. Попробуйте через 2-3 минуты.")
 
 async def send_full_vt_report(message: Message, report: dict):
-    """Отправляет ПОЛНЫЙ отчет КАК НА САЙТЕ"""
     try:
         data = report.get("data", {})
         attributes = data.get("attributes", {})
         
-        # 1. Статистика
         stats = attributes.get("last_analysis_stats", {})
         malicious = stats.get("malicious", 0)
         suspicious = stats.get("suspicious", 0)
@@ -451,7 +495,6 @@ async def send_full_vt_report(message: Message, report: dict):
         
         total = malicious + suspicious + undetected + harmless
         
-        # 2. Основные угрозы
         threat_names = []
         results = attributes.get("last_analysis_results", {})
         
@@ -461,10 +504,8 @@ async def send_full_vt_report(message: Message, report: dict):
                 if threat_name and threat_name not in threat_names:
                     threat_names.append(threat_name)
         
-        # 3. Хеш
         file_hash = attributes.get("sha256", data.get("id", ""))
         
-        # 4. Формируем сообщение
         result_text = f"🛡️ <b>Результат сканирования</b>\n\n"
         result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
         
@@ -479,12 +520,10 @@ async def send_full_vt_report(message: Message, report: dict):
             short_hash = file_hash[:16] + "..." if len(file_hash) > 20 else file_hash
             result_text += f"• Хеш SHA256: <code>{short_hash}</code>\n"
         
-        # 5. Ссылка на сайт
         vt_link = f"https://www.virustotal.com/gui/file/{file_hash}" if file_hash else "https://www.virustotal.com"
         result_text += f"• Ссылка на отчет: {vt_link}\n\n"
         result_text += "<i>✅ Нажмите ссылку для проверки на сайте</i>"
         
-        # 6. Кнопки
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🌐 Открыть на сайте", url=vt_link),
@@ -501,7 +540,6 @@ async def send_full_vt_report(message: Message, report: dict):
         await send_basic_analysis_report(message, report)
 
 async def send_basic_analysis_report(message: Message, analysis_report: dict):
-    """Базовый отчет из анализа"""
     try:
         data = analysis_report.get("data", {})
         attributes = data.get("attributes", {})
@@ -534,8 +572,6 @@ async def send_basic_analysis_report(message: Message, analysis_report: dict):
 async def handle_hash_search(callback_query):
     file_hash_part = callback_query.data.split("_")[1]
     await callback_query.answer("Ищу полный отчет...")
-    
-    # Здесь можно реализовать поиск по частичному хешу
     await callback_query.message.answer("🔍 Используйте команду /hash для тестовых хешей")
 
 @router.message()
