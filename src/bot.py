@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -24,6 +25,14 @@ bot = Bot(
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+# Создаем aiohttp приложение для healthcheck
+app = web.Application()
+
+async def health_check(request):
+    return web.Response(text="OK", status=200)
+
+app.router.add_get('/health', health_check)
 
 # Счетчик задач для пользователей
 user_tasks = {}
@@ -162,9 +171,27 @@ async def handle_file(message: Message):
 async def unknown_message(message: Message):
     await message.answer("🤔 Не понимаю. Используйте /start для справки.")
 
-async def main():
+async def start_bot():
     logger.info("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
+
+async def main():
+    # Запускаем aiohttp сервер для healthcheck
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Получаем порт из окружения Railway (Railway ставит PORT)
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    
+    logger.info(f"Запускаю healthcheck сервер на порту {port}")
+    await site.start()
+    
+    # Запускаем бота в фоне
+    bot_task = asyncio.create_task(start_bot())
+    
+    # Ждем завершения (никогда не завершится)
+    await bot_task
 
 if __name__ == "__main__":
     asyncio.run(main())
