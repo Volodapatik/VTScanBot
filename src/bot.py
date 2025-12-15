@@ -100,8 +100,8 @@ class VirusTotalClient:
             logger.error(f"Ошибка сканирования URL: {e}")
             return None
     
-    async def get_report(self, analysis_id):
-        """Получает отчет по анализу"""
+    async def get_analysis_report(self, analysis_id):
+        """Получает отчет по анализу (для файлов и URL)"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
@@ -120,8 +120,8 @@ class VirusTotalClient:
             logger.error(f"Ошибка получения отчета: {e}")
             return None
     
-    async def get_hash_report(self, file_hash):
-        """Получает отчет по хешу"""
+    async def get_file_report(self, file_hash):
+        """Получает отчет по хешу файла"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
@@ -219,9 +219,9 @@ async def handle_text(message: Message):
         if is_valid_hash(text):
             await message.answer(f"🔍 Ищу отчет по хешу: <code>{text}</code>")
             
-            report = await vt_client.get_hash_report(text)
+            report = await vt_client.get_file_report(text)
             if report:
-                await send_report(message, report)
+                await send_file_report(message, report)
             else:
                 await message.answer("ℹ️ Файл с таким хешем не найден в VirusTotal.")
         
@@ -232,7 +232,7 @@ async def handle_text(message: Message):
             analysis_id = await vt_client.scan_url(text)
             if analysis_id:
                 await message.answer("✅ URL отправлен на сканирование. Жду результаты...")
-                await wait_and_send_report(message, analysis_id)
+                await wait_and_send_report(message, analysis_id, is_url=True)
             else:
                 await message.answer("❌ Ошибка при сканировании URL.")
         
@@ -299,7 +299,7 @@ async def handle_file(message: Message):
         
         if analysis_id:
             await message.answer("✅ Файл отправлен на сканирование. Жду результаты...")
-            await wait_and_send_report(message, analysis_id)
+            await wait_and_send_report(message, analysis_id, is_url=False)
         else:
             await message.answer("❌ Ошибка при отправке файла на сканирование.")
     
@@ -310,17 +310,35 @@ async def handle_file(message: Message):
     finally:
         remove_task(user_id)
 
-async def wait_and_send_report(message: Message, analysis_id: str, attempts: int = 10):
+async def wait_and_send_report(message: Message, analysis_id: str, is_url: bool, attempts: int = 10):
     """Ждет отчет и отправляет его"""
     for i in range(attempts):
         await asyncio.sleep(10)  # Ждем 10 секунд между попытками
         
-        report = await vt_client.get_report(analysis_id)
+        report = await vt_client.get_analysis_report(analysis_id)
         if report:
             status = report.get("data", {}).get("attributes", {}).get("status")
             
             if status == "completed":
-                await send_report(message, report)
+                if is_url:
+                    # Для URL получаем полный отчет по ID
+                    url_id = report.get("data", {}).get("id", "").split("-")[-1]
+                    url_report = await vt_client.get_file_report(url_id)
+                    if url_report:
+                        await send_file_report(message, url_report)
+                    else:
+                        await send_analysis_report(message, report)
+                else:
+                    # Для файлов получаем отчет по хешу
+                    file_hash = report.get("data", {}).get("attributes", {}).get("sha256")
+                    if file_hash:
+                        file_report = await vt_client.get_file_report(file_hash)
+                        if file_report:
+                            await send_file_report(message, file_report)
+                        else:
+                            await send_analysis_report(message, report)
+                    else:
+                        await send_analysis_report(message, report)
                 return
             elif status == "queued":
                 if i == attempts - 1:
@@ -332,41 +350,58 @@ async def wait_and_send_report(message: Message, analysis_id: str, attempts: int
     
     await message.answer("⏳ Сканирование занимает больше времени. Отчет придет позже.")
 
-async def send_report(message: Message, report: dict):
-    """Формирует и отправляет отчет"""
+async def send_file_report(message: Message, report: dict):
+    """Отправляет отчет по файлу (из get_file_report)"""
     try:
         data = report.get("data", {})
         attributes = data.get("attributes", {})
-        stats = attributes.get("stats", {})
         
+        # Получаем статистику
+        stats = attributes.get("last_analysis_stats", {})
         malicious = stats.get("malicious", 0)
-        total = sum(stats.values())
+        suspicious = stats.get("suspicious", 0)
+        undetected = stats.get("undetected", 0)
+        harmless = stats.get("harmless", 0)
+        
+        total_scanners = malicious + suspicious + undetected + harmless
+        
+        # Получаем хеш
+        file_hash = attributes.get("sha256", data.get("id", ""))
+        
+        # Получаем имена угроз
+        threat_names = []
+        results = attributes.get("last_analysis_results", {})
+        for av, result in results.items():
+            if result.get("category") == "malicious":
+                threat_name = result.get("result", "Unknown")
+                if threat_name and threat_name not in threat_names:
+                    threat_names.append(threat_name)
         
         # Формируем сообщение
         result_text = f"🛡️ <b>Результат сканирования</b>\n\n"
-        result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+        result_text += f"• Угроз обнаружено: <b>{malicious}/{total_scanners}</b>\n"
         
-        if malicious > 0:
-            results = attributes.get("results", {})
-            threat_names = []
-            for av, result in results.items():
-                if result.get("category") == "malicious":
-                    threat_names.append(result.get("result", "Unknown"))
-            
-            if threat_names:
-                result_text += f"• Обнаруженные угрозы: {', '.join(threat_names[:3])}\n"
+        if malicious > 0 and threat_names:
+            threats = ", ".join(threat_names[:3])
+            if len(threat_names) > 3:
+                threats += f" и еще {len(threat_names) - 3}"
+            result_text += f"• Обнаруженные угрозы: {threats}\n"
         
-        file_hash = attributes.get("sha256", data.get("id", ""))
         if file_hash:
-            result_text += f"• Хеш (SHA256): <code>{file_hash[:16]}...</code>\n"
+            short_hash = file_hash[:16] + "..." if len(file_hash) > 16 else file_hash
+            result_text += f"• Хеш (SHA256): <code>{short_hash}</code>\n"
         
         result_text += f"• Ссылка на отчет: https://www.virustotal.com/gui/file/{file_hash}"
         
-        # Создаем кнопки
+        # Создаем кнопки (безопасные данные)
+        from urllib.parse import quote
+        safe_file_id = file_hash[:16] if file_hash else "unknown"
+        callback_payload = f"rescan_{safe_file_id}"
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 Пересканировать", 
-                                   callback_data=f"rescan:{file_hash}"),
+                                   callback_data=callback_payload),
                 InlineKeyboardButton(text="📤 Поделиться", 
                                    url=f"https://t.me/share/url?url=https://virustotal.com/gui/file/{file_hash}")
             ]
@@ -375,21 +410,37 @@ async def send_report(message: Message, report: dict):
         await message.answer(result_text, reply_markup=keyboard)
         
     except Exception as e:
-        logger.error(f"Ошибка формирования отчета: {e}")
+        logger.error(f"Ошибка формирования отчета по файлу: {e}")
+        await send_analysis_report(message, report)
+
+async def send_analysis_report(message: Message, report: dict):
+    """Отправляет базовый отчет по анализу (fallback)"""
+    try:
+        data = report.get("data", {})
+        attributes = data.get("attributes", {})
+        
+        stats = attributes.get("stats", {})
+        malicious = stats.get("malicious", 0)
+        total = sum(stats.values()) if stats else 0
+        
+        result_text = f"✅ <b>Сканирование завершено</b>\n\n"
+        result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+        result_text += "• <i>Для подробного отчета попробуйте поиск по хешу файла</i>"
+        
+        await message.answer(result_text)
+        
+    except Exception as e:
+        logger.error(f"Ошибка формирования базового отчета: {e}")
         await message.answer("✅ Сканирование завершено. (Ошибка формирования детального отчета)")
 
-@router.callback_query(F.data.startswith("rescan:"))
+@router.callback_query(F.data.startswith("rescan_"))
 async def handle_rescan(callback_query):
-    file_hash = callback_query.data.split(":")[1]
+    file_hash_part = callback_query.data.split("_")[1]
     await callback_query.answer("Начинаю пересканирование...")
     
-    # Запускаем повторное сканирование
-    analysis_id = await vt_client.scan_url(f"https://virustotal.com/gui/file/{file_hash}")
-    if analysis_id:
-        await callback_query.message.answer("🔍 Пересканирование начато...")
-        await wait_and_send_report(callback_query.message, analysis_id)
-    else:
-        await callback_query.message.answer("❌ Ошибка при пересканировании.")
+    # Здесь нужна логика поиска полного хеша по частичному
+    # Пока просто сообщаем, что функционал в разработке
+    await callback_query.message.answer("🔄 Функция пересканирования будет доступна в следующем обновлении.")
 
 @router.message()
 async def unknown_message(message: Message):
