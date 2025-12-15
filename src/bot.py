@@ -66,13 +66,15 @@ class VirusTotalClient:
                         upload_url,
                         headers=self.headers,
                         files=files,
-                        timeout=30.0
+                        timeout=60.0
                     )
                 
                 if response.status_code == 200:
-                    return response.json().get("data", {}).get("id")
+                    data = response.json()
+                    logger.info(f"Файл загружен, ответ: {json.dumps(data)[:200]}")
+                    return data.get("data", {}).get("id")
                 else:
-                    logger.error(f"VirusTotal error: {response.text}")
+                    logger.error(f"VirusTotal error {response.status_code}: {response.text[:200]}")
                     return None
                     
         except Exception as e:
@@ -91,9 +93,11 @@ class VirusTotalClient:
                 )
                 
                 if response.status_code == 200:
-                    return response.json().get("data", {}).get("id")
+                    data = response.json()
+                    logger.info(f"URL отправлен, ответ: {json.dumps(data)[:200]}")
+                    return data.get("data", {}).get("id")
                 else:
-                    logger.error(f"VirusTotal URL error: {response.text}")
+                    logger.error(f"VirusTotal URL error {response.status_code}: {response.text[:200]}")
                     return None
                     
         except Exception as e:
@@ -113,7 +117,7 @@ class VirusTotalClient:
                 if response.status_code == 200:
                     return response.json()
                 else:
-                    logger.error(f"VirusTotal report error: {response.text}")
+                    logger.error(f"VirusTotal report error {response.status_code}: {response.text[:200]}")
                     return None
                     
         except Exception as e:
@@ -132,7 +136,11 @@ class VirusTotalClient:
                 
                 if response.status_code == 200:
                     return response.json()
+                elif response.status_code == 404:
+                    logger.info(f"Файл с хешем {file_hash} не найден в VirusTotal")
+                    return None
                 else:
+                    logger.error(f"VirusTotal file report error {response.status_code}: {response.text[:200]}")
                     return None
                     
         except Exception as e:
@@ -144,12 +152,10 @@ vt_client = VirusTotalClient()
 # Google Drive клиент (упрощенная версия)
 class GoogleDriveClient:
     def __init__(self):
-        # В реальной версии здесь будет работа с Google Drive API
         pass
     
     async def upload_file(self, file_path):
-        """Загружает файл на Google Drive"""
-        # Заглушка - в реальной версии будет работать
+        """Загружает файл на Google Drive (заглушка)"""
         return f"https://drive.google.com/uc?id=test_{hashlib.md5(file_path.encode()).hexdigest()}"
     
     async def delete_file(self, file_url):
@@ -295,7 +301,8 @@ async def handle_file(message: Message):
             analysis_id = await vt_client.scan_url(file_url)
         
         # Удаляем временный файл
-        os.remove(temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         
         if analysis_id:
             await message.answer("✅ Файл отправлен на сканирование. Жду результаты...")
@@ -313,33 +320,38 @@ async def handle_file(message: Message):
 async def wait_and_send_report(message: Message, analysis_id: str, is_url: bool, attempts: int = 10):
     """Ждет отчет и отправляет его"""
     for i in range(attempts):
-        await asyncio.sleep(10)  # Ждем 10 секунд между попытками
+        await asyncio.sleep(10)
         
         report = await vt_client.get_analysis_report(analysis_id)
         if report:
             status = report.get("data", {}).get("attributes", {}).get("status")
             
             if status == "completed":
-                if is_url:
-                    # Для URL получаем полный отчет по ID
-                    url_id = report.get("data", {}).get("id", "").split("-")[-1]
-                    url_report = await vt_client.get_file_report(url_id)
-                    if url_report:
-                        await send_file_report(message, url_report)
-                    else:
-                        await send_analysis_report(message, report)
-                else:
-                    # Для файлов получаем отчет по хешу
+                logger.info(f"Анализ {analysis_id} завершен, тип: {'URL' if is_url else 'FILE'}")
+                
+                # Для файлов пытаемся получить полный отчет по хешу
+                if not is_url:
+                    # Правильный путь к хешу в ответе анализа
                     file_hash = report.get("data", {}).get("attributes", {}).get("sha256")
+                    logger.info(f"Хеш файла из анализа: {file_hash}")
+                    
                     if file_hash:
+                        # Ждем немного, чтобы VirusTotal успел обработать файл
+                        await asyncio.sleep(5)
+                        
                         file_report = await vt_client.get_file_report(file_hash)
                         if file_report:
+                            logger.info(f"Получен полный отчет для {file_hash}")
                             await send_file_report(message, file_report)
+                            return
                         else:
-                            await send_analysis_report(message, report)
-                    else:
-                        await send_analysis_report(message, report)
+                            logger.warning(f"Не удалось получить полный отчет для {file_hash}")
+                
+                # Для URL или если не удалось получить полный отчет
+                logger.info("Отправляю базовый отчет анализа")
+                await send_analysis_report(message, report)
                 return
+                
             elif status == "queued":
                 if i == attempts - 1:
                     await message.answer("⏳ Сканирование все еще в очереди. Попробуйте позже.")
@@ -348,7 +360,7 @@ async def wait_and_send_report(message: Message, analysis_id: str, is_url: bool,
                 await message.answer(f"⚠️ Статус сканирования: {status}")
                 return
     
-    await message.answer("⏳ Сканирование занимает больше времени. Отчет придет позже.")
+    await message.answer("⏳ Сканирование занимает больше времени. Попробуйте позже.")
 
 async def send_file_report(message: Message, report: dict):
     """Отправляет отчет по файлу (из get_file_report)"""
@@ -393,8 +405,7 @@ async def send_file_report(message: Message, report: dict):
         
         result_text += f"• Ссылка на отчет: https://www.virustotal.com/gui/file/{file_hash}"
         
-        # Создаем кнопки (безопасные данные)
-        from urllib.parse import quote
+        # Создаем кнопки
         safe_file_id = file_hash[:16] if file_hash else "unknown"
         callback_payload = f"rescan_{safe_file_id}"
         
@@ -414,18 +425,39 @@ async def send_file_report(message: Message, report: dict):
         await send_analysis_report(message, report)
 
 async def send_analysis_report(message: Message, report: dict):
-    """Отправляет базовый отчет по анализу (fallback)"""
+    """Отправляет базовый отчет по анализу"""
     try:
         data = report.get("data", {})
         attributes = data.get("attributes", {})
         
         stats = attributes.get("stats", {})
         malicious = stats.get("malicious", 0)
-        total = sum(stats.values()) if stats else 0
+        suspicious = stats.get("suspicious", 0)
+        undetected = stats.get("undetected", 0)
+        harmless = stats.get("harmless", 0)
+        
+        total = malicious + suspicious + undetected + harmless
+        
+        # Если total == 0, пробуем получить из другого места
+        if total == 0:
+            stats = attributes.get("last_analysis_stats", {})
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+            undetected = stats.get("undetected", 0)
+            harmless = stats.get("harmless", 0)
+            total = malicious + suspicious + undetected + harmless
         
         result_text = f"✅ <b>Сканирование завершено</b>\n\n"
-        result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
-        result_text += "• <i>Для подробного отчета попробуйте поиск по хешу файла</i>"
+        
+        if total > 0:
+            result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+            result_text += f"• Подозрительных: {suspicious}\n"
+            result_text += f"• Безопасных: {harmless}\n"
+            result_text += f"• Не обнаружено: {undetected}\n"
+        else:
+            result_text += "• Статистика сканирования недоступна\n"
+        
+        result_text += "\n<i>Для подробного отчета попробуйте поиск по хешу файла через 5-10 минут</i>"
         
         await message.answer(result_text)
         
@@ -437,9 +469,6 @@ async def send_analysis_report(message: Message, report: dict):
 async def handle_rescan(callback_query):
     file_hash_part = callback_query.data.split("_")[1]
     await callback_query.answer("Начинаю пересканирование...")
-    
-    # Здесь нужна логика поиска полного хеша по частичному
-    # Пока просто сообщаем, что функционал в разработке
     await callback_query.message.answer("🔄 Функция пересканирования будет доступна в следующем обновлении.")
 
 @router.message()
