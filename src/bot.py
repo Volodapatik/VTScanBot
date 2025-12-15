@@ -3,6 +3,7 @@ import logging
 import asyncio
 import hashlib
 import time
+import base64
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -153,6 +154,33 @@ class VirusTotalClient:
                     
         except Exception as e:
             logger.error(f"Ошибка получения отчета по хешу: {e}")
+            return None
+    
+    async def get_url_report(self, url):
+        """Получает отчет по URL напрямую"""
+        try:
+            # Кодируем URL в base64
+            url_b64 = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/urls/{url_b64}",
+                    headers=self.headers,
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"ПОЛНЫЙ отчет URL получен для {url}")
+                    return response.json()
+                elif response.status_code == 404:
+                    logger.info(f"URL {url} еще не в базе VirusTotal")
+                    return None
+                else:
+                    logger.error(f"Ошибка отчета URL: {response.status_code}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка получения отчета по URL: {e}")
             return None
 
 vt_client = VirusTotalClient()
@@ -324,13 +352,20 @@ async def handle_text(message: Message):
         elif text.startswith(("http://", "https://")):
             await message.answer(f"🔍 Сканирую URL: <code>{text}</code>")
             
-            result = await vt_client.scan_url(text)
-            if result:
-                await message.answer("✅ URL отправлен. Ожидаю...")
-                await wait_and_process_analysis(message, result['analysis_id'], 
-                                               user_id=user_id, is_url=True)
+            # Сначала проверяем, есть ли уже отчет по этому URL
+            existing_url_report = await vt_client.get_url_report(text)
+            if existing_url_report:
+                logger.info(f"✅ URL уже в базе VT, отправляю полный отчет")
+                await send_full_url_report(message, existing_url_report)
             else:
-                await message.answer("❌ Ошибка при сканировании URL.")
+                # Если отчета нет, запускаем новое сканирование
+                result = await vt_client.scan_url(text)
+                if result:
+                    await message.answer("✅ URL отправлен. Ожидаю...")
+                    await wait_and_process_analysis(message, result['analysis_id'], 
+                                                   user_id=user_id, is_url=True)
+                else:
+                    await message.answer("❌ Ошибка при сканировании URL.")
         
         else:
             await message.answer("❌ Отправьте файл, URL или хеш.")
@@ -427,8 +462,45 @@ async def handle_file(message: Message):
 
 async def wait_and_process_analysis(message: Message, analysis_id: str, user_id: int, 
                                    is_url: bool, known_hash: str = None):
-    logger.info(f"🔍 Ожидание анализа {analysis_id}, известный хеш: {known_hash}")
+    logger.info(f"🔍 Ожидание анализа {analysis_id}, is_url={is_url}")
     
+    # ============ ОБРАБОТКА URL ============
+    if is_url:
+        logger.info("📡 Это URL анализ, жду завершения...")
+        
+        for attempt in range(8):
+            await asyncio.sleep(15)
+            
+            analysis = await vt_client.get_analysis_report(analysis_id)
+            if not analysis:
+                continue
+            
+            status = analysis.get("data", {}).get("attributes", {}).get("status")
+            logger.info(f"URL анализ {analysis_id}, статус: {status}")
+            
+            if status == "completed":
+                # Получаем URL из анализа
+                attrs = analysis.get("data", {}).get("attributes", {})
+                scanned_url = attrs.get("url")
+                
+                if scanned_url:
+                    # Пытаемся получить полный отчет по URL
+                    full_url_report = await vt_client.get_url_report(scanned_url)
+                    if full_url_report:
+                        await send_full_url_report(message, full_url_report)
+                    else:
+                        await send_url_basic_report(message, analysis)
+                else:
+                    await send_url_basic_report(message, analysis)
+                return
+            
+            elif status == "queued":
+                continue
+        
+        await message.answer("⏳ VirusTotal обрабатывает URL. Попробуйте через 2-3 минуты.")
+        return
+    
+    # ============ ОБРАБОТКА ФАЙЛОВ ============
     if known_hash:
         for attempt in range(12):
             await asyncio.sleep(15)
@@ -446,7 +518,7 @@ async def wait_and_process_analysis(message: Message, analysis_id: str, user_id:
                 status = analysis.get("data", {}).get("attributes", {}).get("status")
                 logger.info(f"Статус анализа: {status}")
     
-    logger.info("Использую резервный способ...")
+    logger.info("Использую резервный способ для файлов...")
     
     for attempt in range(8):
         await asyncio.sleep(15)
@@ -538,6 +610,96 @@ async def send_full_vt_report(message: Message, report: dict):
     except Exception as e:
         logger.error(f"Ошибка полного отчета: {e}")
         await send_basic_analysis_report(message, report)
+
+async def send_full_url_report(message: Message, report: dict):
+    """Отправляет полный отчет для URL с кнопкой как для файлов"""
+    try:
+        data = report.get("data", {})
+        attributes = data.get("attributes", {})
+        
+        url = attributes.get("url", "Неизвестный URL")
+        stats = attributes.get("last_analysis_stats", {})
+        
+        malicious = stats.get("malicious", 0)
+        suspicious = stats.get("suspicious", 0)
+        undetected = stats.get("undetected", 0)
+        harmless = stats.get("harmless", 0)
+        
+        total = malicious + suspicious + undetected + harmless
+        
+        # Кодируем URL для ссылки
+        url_b64 = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+        vt_link = f"https://www.virustotal.com/gui/url/{url_b64}"
+        
+        # Собираем угрозы
+        threat_names = []
+        results = attributes.get("last_analysis_results", {})
+        
+        for av, result in results.items():
+            if result.get("category") == "malicious":
+                threat_name = result.get("result", "Unknown")
+                if threat_name and threat_name not in threat_names:
+                    threat_names.append(threat_name)
+        
+        result_text = f"🌐 <b>Результат сканирования URL</b>\n\n"
+        result_text += f"• URL: <code>{url[:50]}...</code>\n"
+        result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+        
+        if malicious > 0 and threat_names:
+            main_threat = threat_names[0]
+            result_text += f"• Основная угроза: <b>{main_threat}</b>\n"
+            
+            if len(threat_names) > 1:
+                result_text += f"• Другие угрозы: еще {len(threat_names)-1}\n"
+        
+        result_text += f"• Ссылка на отчет: {vt_link}\n\n"
+        result_text += "<i>✅ Нажмите ссылку для проверки на сайте</i>"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🌐 Открыть на сайте", url=vt_link)
+            ]
+        ])
+        
+        await message.answer(result_text, reply_markup=keyboard)
+        logger.info(f"✅ Отправлен ПОЛНЫЙ отчет URL для {url}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка полного отчета URL: {e}")
+        await message.answer("🌐 Сканирование URL завершено. Проверьте результаты на сайте VirusTotal.")
+
+async def send_url_basic_report(message: Message, analysis_report: dict):
+    """Базовый отчет для URL (если не удалось получить полный)"""
+    try:
+        data = analysis_report.get("data", {})
+        attributes = data.get("attributes", {})
+        
+        stats = attributes.get("stats", {})
+        malicious = stats.get("malicious", 0)
+        suspicious = stats.get("suspicious", 0)
+        undetected = stats.get("undetected", 0)
+        harmless = stats.get("harmless", 0)
+        
+        total = malicious + suspicious + undetected + harmless
+        
+        url = attributes.get("url", "Неизвестный URL")
+        
+        result_text = f"🌐 <b>Сканирование URL завершено</b>\n\n"
+        result_text += f"• URL: <code>{url[:50]}...</code>\n"
+        
+        if total > 0:
+            result_text += f"• Угроз обнаружено: <b>{malicious}/{total}</b>\n"
+            result_text += f"• Подозрительных: {suspicious}\n"
+        else:
+            result_text += "• Статистика временно недоступна\n"
+        
+        result_text += "\n<i>📊 Полный отчет будет доступен через 1-2 минуты</i>"
+        
+        await message.answer(result_text)
+        
+    except Exception as e:
+        logger.error(f"Ошибка базового отчета URL: {e}")
+        await message.answer("✅ Сканирование URL завершено.")
 
 async def send_basic_analysis_report(message: Message, analysis_report: dict):
     try:
